@@ -46,6 +46,7 @@ impl<'de> Deserialize<'de> for Ref {
     }
 }
 
+#[allow(dead_code)]
 impl Ref {
     fn part(&self, n: usize) -> &str {
         // SAFETY: we verified that we have 4 parts on construction
