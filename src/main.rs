@@ -59,8 +59,7 @@ async fn install_one<ObjectID: FsVerityHashValue>(
     println!("config {}", hex::encode(digest));
     println!("verity {}", verity.to_hex());
 
-    // TODO: use verity
-    let mut fs = composefs_oci::image::create_filesystem(repo, &hex::encode(digest), None)?;
+    let mut fs = composefs_oci::image::create_filesystem(repo, &hex::encode(digest), Some(&verity))?;
     let image_id = fs.commit_image(repo, None)?;
 
     println!("image {}", image_id.to_hex());
