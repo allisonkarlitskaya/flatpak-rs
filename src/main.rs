@@ -1,17 +1,16 @@
 mod index;
+mod install;
 mod manifest;
+mod mount_setattr;
 mod r#ref;
 mod sandbox;
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use crate::{index::get_index, manifest::Manifest, r#ref::Ref, sandbox::run_sandboxed};
+use crate::{index::get_index, r#ref::Ref, sandbox::run_sandboxed};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use composefs::{
-    fsverity::{FsVerityHashValue, Sha256HashValue},
-    repository::Repository,
-};
+use composefs::fsverity::Sha256HashValue;
 
 #[derive(Parser)]
 #[command(
@@ -38,62 +37,12 @@ enum Cmd {
     Install {
         r#ref: Ref,
     },
-    Enter {
-        runtime: String,
-        app: Option<String>,
+    Run {
+        r#ref: Ref,
+        #[clap(long, help = "Command to run instead of default")]
+        command: Option<String>,
+        args: Vec<String>,
     },
-}
-
-async fn install_one<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    img_base: &str,
-    img: &str,
-) -> Result<String> {
-    let mut img_ref = img_base.replace("https", "docker");
-    img_ref.push_str(img);
-
-    println!(">>> Downloading from {img_ref}");
-
-    let (digest, verity) = composefs_oci::pull(repo, &img_ref, None).await?;
-
-    println!("config {}", hex::encode(digest));
-    println!("verity {}", verity.to_hex());
-
-    let mut fs = composefs_oci::image::create_filesystem(repo, &hex::encode(digest), Some(&verity))?;
-    let image_id = fs.commit_image(repo, None)?;
-
-    println!("image {}", image_id.to_hex());
-
-    Ok(hex::encode(digest))
-}
-
-async fn install<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    img_base: &str,
-    index: &HashMap<Ref, (String, Manifest)>,
-    r#ref: &Ref,
-) -> Result<(Option<String>, String)> {
-    let Some((img, manifest)) = index.get(r#ref) else {
-        bail!("No such ref {ref}");
-    };
-
-    println!("First manifest {manifest:?}");
-    let first = install_one(repo, img_base, img).await?;
-
-    let (app, runtime) = if r#ref.is_runtime() {
-        (None, first)
-    } else {
-        let runtime = manifest.get_runtime()?;
-        let Some((runtime_img, runtime_manifest)) = index.get(&runtime) else {
-            bail!("No such ref {ref}");
-        };
-
-        println!("Linked runtime manifest {runtime_manifest:?}");
-        let runtime = install_one(repo, img_base, runtime_img).await?;
-        (Some(first), runtime)
-    };
-
-    Ok((app, runtime))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -143,11 +92,15 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("Fetching index from {}", args.repository))?;
 
-            let (app, runtime) = install(&repo, &args.repository, &index, r#ref).await?;
-            println!("Now: enter {runtime} {}", app.as_deref().unwrap_or(""));
+            install::install(&repo, &args.repository, &index, r#ref).await?;
+            println!("Now: run {ref}");
         }
-        Cmd::Enter { runtime, app } => {
-            run_sandboxed(app.as_deref(), runtime, &repo, "/bin/sh", &[]);
+        Cmd::Run {
+            r#ref,
+            command,
+            args,
+        } => {
+            run_sandboxed(&repo, r#ref, command.as_deref(), args);
         }
     }
 

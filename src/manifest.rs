@@ -1,49 +1,42 @@
-use anyhow::{Result, bail};
-use serde::{Deserialize, Deserializer};
+use anyhow::{Context, Result};
+use ini::{Ini, Properties};
 
 use crate::r#ref::Ref;
 
 // don't store indexes: scanning for the correct parts is fast enough...
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct Manifest(Box<str>);
-
-impl std::str::FromStr for Manifest {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Box::from(s)))
-    }
-}
-
-impl TryFrom<String> for Manifest {
-    type Error = anyhow::Error;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Ok(Manifest(value.into()))
-    }
-}
-
-impl<'de> Deserialize<'de> for Manifest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        s.try_into().map_err(serde::de::Error::custom)
-    }
+#[derive(Debug)]
+pub(crate) struct Manifest {
+    ini: Ini,
 }
 
 impl Manifest {
-    pub(crate) fn get_runtime(&self) -> Result<Ref> {
-        // lol hax
-        let Some(runtime) = self
-            .0
-            .lines()
-            .find_map(|line| line.strip_prefix("runtime="))
-        else {
-            bail!("Manifest is missing runtime= line?");
-        };
+    pub fn new(s: impl AsRef<str>) -> Result<Self> {
+        let ini = Ini::load_from_str(s.as_ref()).context("Failed to parse flatpak manifest")?;
+        Ok(Self { ini })
+    }
 
-        Ref::new_runtime(runtime)
+    fn section(&self, name: &str) -> Result<&Properties> {
+        self.ini
+            .section(Some(name))
+            .with_context(|| format!("Manifest is missing section [{name}]"))
+    }
+
+    pub(crate) fn get(&self, section: &str, key: &str) -> Result<&str> {
+        self.section(section)?
+            .get(key)
+            .with_context(|| format!("Section [{section}] is missing {key}="))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_opt(&self, section: &str, key: &str) -> Option<&str> {
+        self.ini.section(Some(section))?.get(key)
+    }
+
+    pub(crate) fn get_runtime(&self) -> Result<Ref> {
+        Ref::new_runtime(self.get("Application", "runtime")?)
+    }
+
+    pub(crate) fn get_environment(&self) -> Result<impl IntoIterator<Item = (&str, &str)>> {
+        self.section("Environment")
     }
 }

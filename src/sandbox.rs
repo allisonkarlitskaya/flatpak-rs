@@ -1,38 +1,73 @@
+use core::ops::Range;
 use std::{
     collections::HashSet,
+    ffi::OsStr,
     fmt,
     fs::File,
-    io::{BufWriter, Write as IoWrite},
+    io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write as IoWrite},
     path::Path,
     process::{Command, exit},
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
-use composefs::{fsverity::FsVerityHashValue, repository::Repository};
+use anyhow::{Context, Result, bail};
+use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::RegularFile};
 use rustix::{
-    fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    fd::{AsFd, AsRawFd, OwnedFd},
     fs::{CWD, Gid, Mode, OFlags, Uid, fchown, mkdirat, open, openat, symlinkat},
-    io::{Errno, dup, write},
+    io::{Errno, write},
     mount::{
-        FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags,
-        fsconfig_create, fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen,
-        move_mount, open_tree, unmount,
+        FsMountFlags, FsOpenFlags, MountAttrFlags, MountPropagationFlags, MoveMountFlags,
+        OpenTreeFlags, UnmountFlags, fsconfig_create, fsconfig_set_fd, fsconfig_set_flag,
+        fsconfig_set_string, fsmount, fsopen, move_mount, open_tree, unmount,
     },
     path::Arg as PathArg,
-    process::{fchdir, getgid, getuid, pivot_root},
+    process::{fchdir, getgid, getpid, getuid, pivot_root},
     termios::ttyname,
-    thread::{UnshareFlags, set_thread_gid, set_thread_uid, unshare},
+    thread::{UnshareFlags, set_thread_gid, set_thread_groups, set_thread_uid, unshare},
 };
 
 use composefs_fuse::{open_fuse, serve_tree_fuse};
 
-// TODO: upstream this back into composefs
+use crate::{manifest::Manifest, mount_setattr::mount_setattr, r#ref::Ref};
+
+// ! is still experimental, so let's use this instead.
+enum Never {}
+
+#[derive(Debug)]
+enum MappingType {
+    #[allow(dead_code)]
+    NoPreserve,     // flat map of the subrange
+    #[allow(dead_code)]
+    PreserveAsRoot, // preserve the "outside" uid/gid as 0:0
+    PreserveAsUser, // preserve the "outside" uid/gid as the target user
+}
+
+#[derive(Debug)]
+enum SandboxType {
+    #[allow(dead_code)]
+    Simple,                      // single uid/gid mapping
+    #[allow(dead_code)]
+    RequireMapping(MappingType), // require newuidmap/newgidmap
+    TryMapping(MappingType),     // use newuidmap/newgidmap if available
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+enum ShareFlags {
+    Home,
+    XdgRuntimeDir,
+    SessionBus,
+    Wayland,
+}
+
+// TODO: upstream this back into composefs?
+#[derive(Debug)]
 pub struct FsHandle {
     fsfd: OwnedFd,
     name: &'static str, // for debug messages
 }
 
+#[allow(dead_code)]
 impl FsHandle {
     pub fn open(name: &'static str) -> Result<FsHandle> {
         let fsfd = fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)
@@ -121,12 +156,22 @@ impl MountHandle {
         Ok(Self::new(open_tree(dirfd.as_fd(), path, flags)?))
     }
 
-    pub fn pivot_root(self) -> Result<()> {
+    pub fn pivot_root(&self) -> Result<()> {
         fchdir(&self.mountfd)?;
         pivot_root(".", ".")?;
         unmount("/", UnmountFlags::DETACH)?;
 
         Ok(())
+    }
+
+    pub fn make_readonly(&self) -> Result<()> {
+        mount_setattr(
+            &self.mountfd,
+            MountAttrFlags::MOUNT_ATTR_RDONLY,
+            MountAttrFlags::empty(),
+            MountPropagationFlags::empty(),
+        )
+        .context("Unable to make mount readonly")
     }
 
     pub fn move_to(&self, dirfd: impl AsFd, name: impl PathArg) -> Result<()> {
@@ -142,11 +187,11 @@ impl MountHandle {
     }
 }
 
-// ! is still experimental, so let's use this instead.
-pub(crate) enum Never {}
-
-fn mount_tmpfs(name: &str) -> Result<MountHandle> {
-    FsHandle::open("tmpfs")?.set_string("source", name)?.mount()
+fn mount_tmpfs(name: &str, mode: u16) -> Result<MountHandle> {
+    FsHandle::open("tmpfs")?
+        .set_string("source", name)?
+        .set_mode("mode", mode)?
+        .mount()
 }
 
 fn mount_devpts() -> Result<MountHandle> {
@@ -176,36 +221,74 @@ fn open_dir(dirfd: impl AsFd, name: impl PathArg) -> rustix::io::Result<OwnedFd>
 }
 
 fn mount_fuse_composefs(
-    name: &str,
+    r#ref: &Ref,
     repo: &Arc<Repository<impl FsVerityHashValue>>,
-) -> Result<MountHandle> {
+) -> Result<(Manifest, MountHandle)> {
     let dev_fuse = open_fuse()?;
 
     // Create the mount
     let mount = FsHandle::open("fuse")?
         .set_flag("ro")?
-        .set_flag("default_permissions")?
+        //.set_flag("default_permissions")?
         .set_flag("allow_other")?
-        .set_string("source", "composefs-fuse")?
+        .set_string("source", &format!("composefs-fuse:{ref}"))?
         .set_fd_str("fd", &dev_fuse)?
         .set_mode("rootmode", 0o40555)?
         .set_int("user_id", getuid().as_raw())?
         .set_int("group_id", getgid().as_raw())?
         .mount()?;
 
-    // Spawn the server thread
+    // Spawn the server thread.  Awkwardly, we need to do the actual building of the image inside
+    // of the thread because Filesystem isn't Send or Sync, owing to its use of Rc.  We use a mpsc
+    // to pass the result back, along with the manifest (which we also want to extract).
     let repo = Arc::clone(repo);
-    let name = name.to_string();
+    let name = format!("refs/flatpak-rs/{ref}");
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Manifest>>();
+
     std::thread::spawn(move || {
-        let filesystem = composefs_oci::image::create_filesystem(&repo, &name, None).expect("bzzt");
+        let read_fs_and_metadata = || {
+            let filesystem = composefs_oci::image::create_filesystem(&repo, &name, None)?;
+            let manifest = match filesystem.root.get_file("metadata".as_ref())? {
+                RegularFile::Inline(data) => data.clone().into_vec(),
+                RegularFile::External(id, ..) => {
+                    let mut data = vec![];
+                    File::from(repo.open_object(id)?).read_to_end(&mut data)?;
+                    data
+                }
+            };
+
+            let manifest = Manifest::new(
+                std::str::from_utf8(&manifest).context("Flatpak manifest is not valid utf-8")?,
+            )?;
+
+            Ok((filesystem, manifest))
+        };
+
+        let filesystem = match read_fs_and_metadata() {
+            Ok((filesystem, manifest)) => {
+                tx.send(Ok(manifest)).unwrap();
+                filesystem
+            }
+            Err(err) => {
+                tx.send(Err(err)).unwrap();
+                return;
+            }
+        };
+
         let files = filesystem
             .root
             .get_directory("files".as_ref())
             .expect("no files");
-        serve_tree_fuse(dev_fuse, files, &repo).expect("bzzt2");
+
+        if let Err(err) = serve_tree_fuse(dev_fuse, files, &repo) {
+            log::error!("FUSE server for composefs:{name} terminated irregularly: {err}");
+        }
     });
 
-    Ok(mount)
+    let manifest = rx.recv()??;
+
+    Ok((manifest, mount))
 }
 
 fn bind_controlling_terminal() -> Result<Option<MountHandle>> {
@@ -223,14 +306,8 @@ fn bind_controlling_terminal() -> Result<Option<MountHandle>> {
         .transpose()
 }
 
-struct DirBuilder {
-    dirfd: OwnedFd,
-}
-
-impl AsFd for DirBuilder {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.dirfd.as_fd()
-    }
+struct DirBuilder<'a> {
+    dirfd: &'a OwnedFd,
 }
 
 fn filter_errno<T>(result: rustix::io::Result<T>, ignored: Errno) -> rustix::io::Result<Option<T>> {
@@ -241,8 +318,18 @@ fn filter_errno<T>(result: rustix::io::Result<T>, ignored: Errno) -> rustix::io:
     }
 }
 
-impl DirBuilder {
-    fn new(dirfd: OwnedFd) -> Self {
+impl<'a> DirBuilder<'a> {
+    // Note: in case we do a simple uid map, we end up running some prep commands (like ldconfig) as
+    // the target uid:gid.  We do this while still holding a full set of capabilities, but the kernel
+    // automatically drops capabilities on execve() for non-numerically-0 effective uid.  Create
+    // our various directories around the filesystem such that these spawned commands can write to
+    // them even without caps: we're going to remount 'ro' before starting the application anyway.
+    const DIR_PERMISSION: u32 = 0o755;
+
+    // We don't have the same concerns around files, but let's be consistent.
+    const FILE_PERMISSION: u32 = 0o644;
+
+    fn new(dirfd: &'a OwnedFd) -> Self {
         Self { dirfd }
     }
 
@@ -250,7 +337,7 @@ impl DirBuilder {
         let (dirfd, name) = if let Some((parent, name)) = name.rsplit_once('/') {
             (&self.create_dir(parent, mode, true)?, name)
         } else {
-            (&self.dirfd, name)
+            (self.dirfd, name)
         };
 
         // If exist_ok then optimistically assume that the directory might already exist
@@ -269,32 +356,21 @@ impl DirBuilder {
         Ok(open_dir(dirfd, name)?)
     }
 
-    fn mkdir(&self, name: &str, mode: u32) -> Result<()> {
-        let (dirfd, name) = if let Some((parent, name)) = name.rsplit_once('/') {
-            (&self.create_dir(parent, mode, true)?, name)
-        } else {
-            (&self.dirfd, name)
-        };
-
-        mkdirat(dirfd, name, mode.into())
-            .with_context(|| format!("Unable to create directory {name}"))
-    }
-
     fn create_file(&self, name: &str) -> Result<OwnedFd> {
         let (dirfd, name) = if let Some((parent, name)) = name.rsplit_once('/') {
-            (&self.create_dir(parent, 0o755, true)?, name)
+            (&self.create_dir(parent, Self::DIR_PERMISSION, true)?, name)
         } else {
-            (&self.dirfd, name)
+            (self.dirfd, name)
         };
 
         let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
-        openat(dirfd, name, flags, 0o644.into())
+        openat(dirfd, name, flags, Self::FILE_PERMISSION.into())
             .with_context(|| format!("Failed to open {name:?} for writing"))
     }
 
     fn subdir(&self, name: &str, populate: impl Fn(DirBuilder) -> Result<()>) -> Result<()> {
         populate(DirBuilder {
-            dirfd: self.create_dir(name, 0o755, false)?,
+            dirfd: &self.create_dir(name, Self::DIR_PERMISSION, false)?,
         })
         .with_context(|| format!("Failed to populate subdir {name}"))
     }
@@ -313,12 +389,12 @@ impl DirBuilder {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<()> {
-        symlinkat(target, &self.dirfd, name)
+        symlinkat(target, self.dirfd, name)
             .with_context(|| format!("Failed to symlink {name:?} -> {target:?}"))
     }
 
     fn mount(&self, name: &str, mnt: MountHandle) -> Result<()> {
-        mnt.move_to(self.create_dir(name, 0o755, false)?, "")
+        mnt.move_to(self.create_dir(name, Self::DIR_PERMISSION, false)?, "")
     }
 
     fn bind_dir(&self, name: &str, from_dirfd: impl AsFd, from_name: impl PathArg) -> Result<()> {
@@ -330,51 +406,191 @@ impl DirBuilder {
     }
 }
 
-struct SandboxConfig<ObjectID: FsVerityHashValue> {
-    repo: Arc<Repository<ObjectID>>,
-    app: Option<String>,
-    runtime: String,
+fn find_range(filename: &str, username: &str) -> Result<Option<Range<u32>>> {
+    let file = match File::open(filename) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => Err(err).context(format!("Failed to open {filename}"))?,
+    };
+
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("Failed to read from {filename}"))?;
+        let mut parts = line.split(':');
+        if parts.next() == Some(username) {
+            let mut u32_parts = parts.map(str::parse::<u32>);
+            match (u32_parts.next(), u32_parts.next()) {
+                (Some(Ok(start)), Some(Ok(len))) => return Ok(Some(start..(start + len))),
+                _ => bail!("Incorrectly formatted line in {filename}: {line}"),
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn compute_mapping(mut subrange: Range<u32>, preserve: Option<(u32, u32)>) -> Vec<u32> {
+    let mut result = vec![];
+    let mut covered = 0;
+
+    if let Some((preserve_inside, preserve_outside)) = preserve {
+        let before_len = std::cmp::min(subrange.end - subrange.start, preserve_inside);
+        if before_len > 0 {
+            result.extend_from_slice(&[covered, subrange.start, before_len]);
+            subrange = subrange.start + before_len..subrange.end;
+            covered += before_len;
+        }
+
+        result.extend_from_slice(&[preserve_inside, preserve_outside, 1]);
+        covered += 1;
+    }
+
+    if !subrange.is_empty() {
+        result.extend_from_slice(&[covered, subrange.start, subrange.end - subrange.start]);
+    }
+
+    result
+}
+
+fn flatten<T: ToString>(values: &[T]) -> String {
+    values
+        .iter()
+        .map(T::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn unshare_userns_newuidmap_newgidmap(uid: u32, gid: u32, mapping: &MappingType) -> Result<bool> {
+    let username = whoami::username();
+    let uid_range = find_range("/etc/subuid", &username)?;
+    let gid_range = find_range("/etc/subgid", &username)?;
+    let pid = rustix::process::Pid::as_raw(Some(getpid()));
+
+    let (Some(uid_range), Some(gid_range)) = (uid_range, gid_range) else {
+        // We can't do it this way, so abort before we start trying.
+        return Ok(false);
+    };
+
+    let (uid_preserve, gid_preserve) = match mapping {
+        MappingType::NoPreserve => (None, None),
+        MappingType::PreserveAsRoot => (Some((0, getuid().as_raw())), Some((0, getgid().as_raw()))),
+        MappingType::PreserveAsUser => (
+            Some((uid, getuid().as_raw())),
+            Some((gid, getgid().as_raw())),
+        ),
+    };
+
+    // We're committed now.  We either succeed or fail.  Compute our mappings.
+    let uidmap = flatten(&compute_mapping(uid_range, uid_preserve));
+    let gidmap = flatten(&compute_mapping(gid_range, gid_preserve));
+
+    // We can avoid fork() by using a small shell helper.  It remains in the original user
+    // namespace, waits until we write a line to its stdin and then does the uid mapping for us.
+    // We write that line after we unshare our namespace, and then wait the process to make sure
+    // everything went OK.
+    let mut cmd = Command::new("sh")
+        .stdin(std::process::Stdio::piped())
+        .arg("-cxe")
+        .arg(format!(
+            "read; newuidmap {pid} {uidmap}; newgidmap {pid} {gidmap};"
+        ))
+        .spawn()?;
+
+    unshare(UnshareFlags::NEWUSER).context("Unable to create new user namespace")?;
+
+    // Write a line to stdin to cause the 'read' in the above shell script to finish.
+    // SAFETY: We know we did .stdin() with a pipe, above, so this will not panic.
+    writeln!(cmd.stdin.take().unwrap())?;
+
+    match cmd.wait().context("Unable to run newuidmap")?.code() {
+        Some(0) => {}
+        _other => {
+            panic!("uidmap failed");
+        }
+    };
+
+    // The POSIX security model says that we shouldn't be allowed to drop groups, but newgidmap
+    // blows a giant hole in that by installing a gid_map without first setting setgroup to "deny".
+    // I guess we can drop our extra groups, after all...
+    set_thread_groups(&[]).context("Unable to setgroups([])")?;
+
+    // With a mapped UID range present we can do our setup procedure as uid/gid 0:0
+    set_thread_uid(Uid::ROOT).context("Unable to setuid(0)")?;
+    set_thread_gid(Gid::ROOT).context("Unable to setgid(0)")?;
+
+    Ok(true)
+}
+
+fn unshare_userns_simple(inside_uid: u32, inside_gid: u32) -> Result<()> {
+    let uid = getuid().as_raw();
+    let gid = getgid().as_raw();
+
+    // See user_namespaces(7): we must not be permitted to drop groups (as viewed from the
+    // parent namespace) or else we might be able to gain permissions (imagine a file where the
+    // "group" access rights are less than "other").  As such, since we're setting our own
+    // "gid_map", we need to write "deny" to "setgroups" before we can write a "gid_map" (which
+    // would otherwise enable the setgroups() call).  If we were using newgidmap we could
+    // circumvent this, but we're not.
+    //
+    // This basically means that if the calling user was carrying extra groups, they'll have
+    // these groups show up as "nobody" inside the sandbox.
+
+    unshare(UnshareFlags::NEWUSER).context("Unable to create new user namespace")?;
+    write_to("/proc/self/uid_map", &format!("{inside_uid} {uid} 1\n"))?;
+    write_to("/proc/self/setgroups", "deny\n")?;
+    write_to("/proc/self/gid_map", &format!("{inside_gid} {gid} 1\n"))?;
+
+    // We started out as {uid} and mapped that to {inside_uid} (ditto for gid) so we're now running
+    // as inside_uid:inside_gid but with all capabilities present.  We'll do our setup like this.
+    // Later: we remount / as read-only and call setuid()/setgid() to drop capabilities.
+
+    Ok(())
+}
+
+struct Sandbox {
+    sandbox_type: SandboxType,
+    uid: Uid,
+    gid: Gid,
 
     username: String,
     groupname: String,
     gecos: String,
-    uid: Uid,
-    gid: Gid,
     home: String,
 
-    flags: HashSet<String>,
+    share: HashSet<ShareFlags>,
 }
 
-impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
+impl Sandbox {
     fn unshare(&self) -> Result<()> {
-        let outside_uid = getuid().as_raw();
-        let outside_gid = getgid().as_raw();
+        let inside_uid = self.uid.as_raw();
+        let outside_gid = self.gid.as_raw();
 
-        unshare(UnshareFlags::NEWUSER).context("Unable to create new user namespace")?;
+        // Unshare user namespace
+        match &self.sandbox_type {
+            SandboxType::Simple => unshare_userns_simple(inside_uid, outside_gid)?,
+            SandboxType::RequireMapping(mapping_type) => {
+                if !unshare_userns_newuidmap_newgidmap(inside_uid, outside_gid, mapping_type)? {
+                    bail!("Unable to find usable subuid/subgid ranges and mapping is required");
+                }
+            }
+            SandboxType::TryMapping(mapping_type) => {
+                if !unshare_userns_newuidmap_newgidmap(inside_uid, outside_gid, mapping_type)? {
+                    unshare_userns_simple(inside_uid, outside_gid)?;
+                }
+            }
+        }
 
-        let uid = self.uid.as_raw();
-        let gid = self.gid.as_raw();
-
-        write_to("/proc/self/uid_map", &format!("{uid} {outside_uid} 1\n"))?;
-        write_to("/proc/self/setgroups", "deny\n")?;
-        write_to("/proc/self/gid_map", &format!("{gid} {outside_gid} 1\n"))?;
-
-        // NB: we're definitely single-threaded at the moment (since unshare(NEWUSER) succeeded)
-
-        //set_thread_uid(Uid::ROOT).context("Unable to setuid(0)")?;
-        //set_thread_gid(Gid::ROOT).context("Unable to setgid(0)")?;
-
-        // TODO: figure out how to unset this without getting EPERM
-        // set_thread_groups(&[Gid::ROOT]).context("Unable to drop supplementary groups")?;
-
+        // Unshare mount namespace
         unshare(UnshareFlags::NEWNS).context("Unable to create new mount namespace")?;
+
+        // Unshare PID namespace: we can't do that because of our FUSE threads
+        // unshare(UnshareFlags::NEWPID).context("Unable to create new pid namespace")?;
 
         Ok(())
     }
 
     fn drop_capabilities(&self) -> Result<()> {
-        set_thread_uid(self.uid).with_context(|| format!("Unable to setuid({:?})", self.uid))?;
         set_thread_gid(self.gid).with_context(|| format!("Unable to setgid({:?})", self.gid))?;
+        set_thread_uid(self.uid).with_context(|| format!("Unable to setuid({:?})", self.uid))?;
         Ok(())
     }
 
@@ -395,7 +611,7 @@ impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
         dev.symlink("ptmx", "pts/ptmx")?;
 
         dev.mount("pts", mount_devpts()?)?;
-        dev.mount("shm", mount_tmpfs("shm")?)?;
+        dev.mount("shm", mount_tmpfs("shm", 0o1777)?)?;
 
         Ok(())
     }
@@ -448,11 +664,11 @@ impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
     fn populate_xdg_runtime_dir(&self, xdg_runtime_dir: DirBuilder, hostdir: &Path) -> Result<()> {
         let hostdir = open_dir(CWD, hostdir)?;
 
-        if self.flags.contains("wayland") {
+        if self.share.contains(&ShareFlags::Wayland) {
             xdg_runtime_dir.bind_file("wayland-0", &hostdir, "wayland-0")?;
         }
 
-        if self.flags.contains("session-bus") {
+        if self.share.contains(&ShareFlags::SessionBus) {
             xdg_runtime_dir.bind_file("bus", &hostdir, "bus")?;
         }
 
@@ -463,7 +679,7 @@ impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
         if let Some(xdg_runtime_dir) = dirs::runtime_dir() {
             run.subdir("user", |user| {
                 let uid = self.uid.as_raw().to_string();
-                if self.flags.contains("xdg-runtime-dir") {
+                if self.share.contains(&ShareFlags::XdgRuntimeDir) {
                     user.bind_dir(&uid, CWD, &xdg_runtime_dir)
                 } else {
                     user.subdir(&uid, |dir| {
@@ -473,10 +689,12 @@ impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
             })?;
         }
 
-        run.bind_dir("host", CWD, "/")
+        //run.bind_dir("host", CWD, "/");
+
+        Ok(())
     }
 
-    fn populate_root(&self, root: DirBuilder) -> Result<()> {
+    fn populate_root(&self, root: &DirBuilder) -> Result<()> {
         root.symlink("bin", "usr/bin")?;
         root.symlink("lib", "usr/lib")?;
         root.symlink("lib64", "usr/lib64")?;
@@ -488,15 +706,10 @@ impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
         root.subdir("var", |var| var.symlink("run", "../run"))?;
         root.bind_dir("proc", CWD, "/proc")?;
         root.bind_dir("sys", CWD, "/sys")?;
-        root.mkdir("tmp", 0o1777)?;
-
-        root.mount("usr", mount_fuse_composefs(&self.runtime, &self.repo)?)?;
-        if let Some(app) = &self.app {
-            root.mount("app", mount_fuse_composefs(app, &self.repo)?)?;
-        }
+        root.mount("tmp", mount_tmpfs("tmp", 0o1777)?)?;
 
         if let Some(rel) = self.home.strip_prefix("/") {
-            if self.flags.contains("home") {
+            if self.share.contains(&ShareFlags::Home) {
                 root.bind_dir(rel, CWD, &self.home)?;
             } else {
                 fchown(
@@ -510,85 +723,114 @@ impl<ObjectID: FsVerityHashValue> SandboxConfig<ObjectID> {
         Ok(())
     }
 
-    fn create_rootfs(&self) -> Result<MountHandle> {
-        let root = mount_tmpfs("flatpak-root")
+    fn create_rootfs(
+        &self,
+        app_mount: Option<MountHandle>,
+        usr_mount: MountHandle,
+    ) -> Result<MountHandle> {
+        let rootmnt = mount_tmpfs("flatpak-root", 0o755)
             .context("Failed to mount tmpfs for sandbox root filesystem")?;
 
-        // Take this out later.  Only needed for kernels < 6.15.
-        root.move_to(CWD, "/tmp")?;
+        // TODO: Take this out later.  Only needed for kernels < 6.15.
+        rootmnt.move_to(CWD, "/tmp")?;
 
-        self.populate_root(DirBuilder::new(dup(&root.mountfd)?))?;
+        let root = DirBuilder::new(&rootmnt.mountfd);
+        self.populate_root(&root)?;
 
-        Ok(root)
+        root.mount("usr", usr_mount)?;
+        if let Some(app) = app_mount {
+            root.mount("app", app)?;
+        }
+
+        Ok(rootmnt)
+    }
+
+    fn run(
+        &self,
+        repo: &Arc<Repository<impl FsVerityHashValue>>,
+        r#ref: &Ref,
+        command: Option<&str>,
+        args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    ) -> Result<Never> {
+        // Unshare namespaces
+        self.unshare()?;
+
+        // We need to mount the fuse filesystems after the unshare() because they run in threads and we
+        // can't unshare the userns in a process with threads.
+        let (app_manifest, app_mount, runtime_manifest, usr_mount) = if r#ref.is_app() {
+            let (app_manifest, app_mount) = mount_fuse_composefs(r#ref, repo)?;
+            let (runtime_manifest, usr_mount) =
+                mount_fuse_composefs(&app_manifest.get_runtime()?, repo)?;
+            (
+                Some(app_manifest),
+                Some(app_mount),
+                runtime_manifest,
+                usr_mount,
+            )
+        } else {
+            let (runtime_manifest, usr_mnt) = mount_fuse_composefs(r#ref, repo)?;
+            (None, None, runtime_manifest, usr_mnt)
+        };
+
+        // Build our rootfs and pivot into it
+        let rootfs = self.create_rootfs(app_mount, usr_mount)?;
+        rootfs.pivot_root()?;
+
+        // TODO: apparently we should cache this...
+        Command::new("ldconfig")
+            .arg("-X")
+            .status()
+            .context("Unable to run ldconfig")?;
+
+        // No more changes: make the rootfs readonly and change to the target uid/gid
+        rootfs.make_readonly()?;
+        self.drop_capabilities()?;
+
+        let command = if let Some(command) = command {
+            command
+        } else if let Some(manifest) = app_manifest.as_ref() {
+            manifest.get("Application", "command")?
+        } else {
+            "/bin/sh"
+        };
+
+        // Run our command
+        let status = Command::new(command)
+            .args(args)
+            .envs(runtime_manifest.get_environment()?)
+            .env("PATH", "/app/bin:/usr/bin")
+            .env("FLATPAK_ID", r#ref.get_id())
+            .env("PS1", "[📦 $FLATPAK_ID \\W]\\$ ")
+            .current_dir(&self.home)
+            .status()
+            .context("Unable to spawn /bin/sh")?;
+
+        if let Some(code) = status.code() {
+            exit(code);
+        } else {
+            exit(255);
+        }
     }
 }
 
-/// Run the app after the sandbox has been established.
-fn run_app(
-    app: Option<&str>,
-    runtime: &str,
+pub(crate) fn run_sandboxed(
     repo: &Arc<Repository<impl FsVerityHashValue>>,
-    command: &str,
-    args: &[&str],
-) -> Result<Never> {
-    let sandbox = SandboxConfig {
-        repo: Arc::clone(repo),
-        app: app.map(str::to_string),
-        runtime: runtime.to_string(),
+    r#ref: &Ref,
+    command: Option<&str>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> ! {
+    let sandbox = Sandbox {
+        sandbox_type: SandboxType::TryMapping(MappingType::PreserveAsUser),
         username: whoami::username(),
         groupname: whoami::username(), // *shrug*
         gecos: whoami::realname(),
         uid: getuid(),
         gid: getgid(),
         home: dirs::home_dir().unwrap().to_str().unwrap().to_string(),
-        flags: HashSet::from(
-            ["home", "xdg-runtime-dir", "wayland", "session-bus"].map(|s| s.to_string()),
-        ),
+        share: HashSet::from([ShareFlags::Home, ShareFlags::XdgRuntimeDir]),
     };
 
-    sandbox.unshare()?;
-    sandbox.create_rootfs()?.pivot_root()?;
-
-    Command::new("ldconfig")
-        .arg("-X")
-        .status()
-        .context("Unable to run ldconfig")?;
-
-    sandbox.drop_capabilities()?;
-
-    let status = Command::new(command)
-        .args(args)
-        .current_dir(sandbox.home)
-        .env("XDG_CONFIG_DIRS", "/app/etc/xdg:/etc/xdg")
-        .env("GI_TYPELIB_PATH", "/app/lib64/girepository-1.0")
-        .env(
-            "GST_PLUGIN_SYSTEM_PATH",
-            "/app/lib64/gstreamer-1.0:/usr/lib64/extensions/gstreamer-1.0:/usr/lib64/gstreamer-1.0",
-        )
-        .env(
-            "XDG_DATA_DIRS",
-            "/app/share:/usr/share:/usr/share/runtime/share:/run/host/user-share:/run/host/share",
-        )
-        .env("PATH", "/app/bin:/usr/bin")
-        .env("FLATPAK_ID", "org.flatpak.test")
-        .env("PS1", "[📦 $FLATPAK_ID \\W]\\$ ")
-        .status()
-        .context("Unable to spawn /bin/sh")?;
-
-    if let Some(code) = status.code() {
-        exit(code);
-    } else {
-        exit(255);
+    match sandbox.run(repo, r#ref, command, args) {
+        Err(err) => panic!("Failed to execute app in sandbox: {err}"),
     }
-}
-
-pub(crate) fn run_sandboxed(
-    app: Option<&str>,
-    runtime: &str,
-    repo: &Arc<Repository<impl FsVerityHashValue>>,
-    command: &str,
-    args: &[&str],
-) -> ! {
-    run_app(app, runtime, repo, command, args).expect("Failed to execute app in sandbox");
-    unreachable!(); // sigh
 }

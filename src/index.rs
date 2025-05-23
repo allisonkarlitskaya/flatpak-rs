@@ -7,7 +7,7 @@ use reqwest::{Client, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use serde::Deserialize;
 
-use crate::{manifest::Manifest, r#ref::Ref};
+use crate::r#ref::Ref;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -34,7 +34,7 @@ struct Labels {
     #[serde(rename = "org.flatpak.ref")]
     r#ref: Ref,
     #[serde(rename = "org.flatpak.metadata")]
-    metadata: Manifest,
+    metadata: String,
 }
 
 fn get_oci_arch() -> &'static str {
@@ -67,7 +67,7 @@ fn create_client() -> ClientWithMiddleware {
     builder.build()
 }
 
-pub(crate) async fn get_index(repository: &str) -> Result<HashMap<Ref, (String, Manifest)>> {
+pub(crate) async fn get_index(repository: &str) -> Result<HashMap<Ref, (String, String)>> {
     let mut index = Url::parse(repository)?.join("index/static")?;
 
     let mut pairs = index.query_pairs_mut();
