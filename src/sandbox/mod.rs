@@ -5,11 +5,10 @@ mod util;
 
 use core::ops::Range;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader, ErrorKind, Read, Write},
-    path::Path,
     process::{Command, exit},
     sync::Arc,
 };
@@ -320,6 +319,8 @@ struct Sandbox {
     home: String,
 
     share: HashSet<ShareFlags>,
+
+    env: HashMap<&'static str, Option<String>>,
 }
 
 impl Sandbox {
@@ -508,8 +509,16 @@ impl Sandbox {
         Ok(rootmnt)
     }
 
+    fn setenv(&mut self, key: &'static str, value: impl Into<String>) {
+        self.env.insert(key, Some(value.into()));
+    }
+
+    fn unsetenv(&mut self, key: &'static str) {
+        self.env.insert(key, None);
+    }
+
     fn run(
-        &self,
+        &mut self,
         repo: &Arc<Repository<impl FsVerityHashValue>>,
         r#ref: &Ref,
         command: Option<&str>,
@@ -558,15 +567,26 @@ impl Sandbox {
         };
 
         // Run our command
-        let status = Command::new(command)
-            .args(args)
-            .envs(runtime_manifest.get_environment()?)
-            .env("PATH", "/app/bin:/usr/bin")
-            .env("FLATPAK_ID", r#ref.get_id())
-            .env("PS1", "[📦 $FLATPAK_ID \\W]\\$ ")
-            .current_dir(&self.home)
+        let mut command = Command::new(command);
+        command.args(args);
+        command.current_dir(&self.home);
+        command.envs(runtime_manifest.get_environment()?);
+
+        for (key, value) in &self.env {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+
+        command.env("PATH", "/app/bin:/usr/bin");
+        command.env("FLATPAK_ID", r#ref.get_id());
+        command.env("PS1", "[📦 $FLATPAK_ID \\W]\\$ ");
+
+        let status = command
             .status()
-            .context("Unable to spawn /bin/sh")?;
+            .with_context(|| format!("Unable to spawn {command:?}"))?;
 
         if let Some(code) = status.code() {
             exit(code);
@@ -582,7 +602,7 @@ pub(crate) fn run_sandboxed(
     command: Option<&str>,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> ! {
-    let sandbox = Sandbox {
+    let mut sandbox = Sandbox {
         sandbox_type: SandboxType::TryMapping(MappingType::PreserveAsUser),
         username: whoami::username(),
         groupname: whoami::username(), // *shrug*
@@ -591,6 +611,7 @@ pub(crate) fn run_sandboxed(
         gid: getgid(),
         home: dirs::home_dir().unwrap().to_str().unwrap().to_string(),
         share: HashSet::from([ShareFlags::Home, ShareFlags::XdgRuntimeDir]),
+        env: HashMap::new(),
     };
 
     match sandbox.run(repo, r#ref, command, args) {
