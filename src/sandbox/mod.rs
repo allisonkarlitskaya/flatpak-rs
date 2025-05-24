@@ -310,6 +310,8 @@ fn unshare_userns_simple(inside_uid: u32, inside_gid: u32) -> Result<()> {
 }
 
 struct Sandbox {
+    r#ref: Ref,
+
     sandbox_type: SandboxType,
     uid: Uid,
     gid: Gid,
@@ -534,7 +536,6 @@ impl Sandbox {
     fn run(
         &mut self,
         repo: &Arc<Repository<impl FsVerityHashValue>>,
-        r#ref: &Ref,
         command: Option<&str>,
         args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     ) -> Result<Never> {
@@ -543,8 +544,8 @@ impl Sandbox {
 
         // We need to mount the fuse filesystems after the unshare() because they run in threads and we
         // can't unshare the userns in a process with threads.
-        let (app_manifest, app_mount, runtime_manifest, usr_mount) = if r#ref.is_app() {
-            let (app_manifest, app_mount) = mount_fuse_composefs(r#ref, repo)?;
+        let (app_manifest, app_mount, runtime_manifest, usr_mount) = if self.r#ref.is_app() {
+            let (app_manifest, app_mount) = mount_fuse_composefs(&self.r#ref, repo)?;
             let (runtime_manifest, usr_mount) =
                 mount_fuse_composefs(&app_manifest.get_runtime()?, repo)?;
             (
@@ -554,7 +555,7 @@ impl Sandbox {
                 usr_mount,
             )
         } else {
-            let (runtime_manifest, usr_mnt) = mount_fuse_composefs(r#ref, repo)?;
+            let (runtime_manifest, usr_mnt) = mount_fuse_composefs(&self.r#ref, repo)?;
             (None, None, runtime_manifest, usr_mnt)
         };
 
@@ -595,7 +596,7 @@ impl Sandbox {
         }
 
         command.env("PATH", "/app/bin:/usr/bin");
-        command.env("FLATPAK_ID", r#ref.get_id());
+        command.env("FLATPAK_ID", self.r#ref.get_id());
         command.env("PS1", "[📦 $FLATPAK_ID \\W]\\$ ");
 
         let status = command
@@ -617,6 +618,8 @@ pub(crate) fn run_sandboxed(
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> ! {
     let mut sandbox = Sandbox {
+        r#ref: r#ref.clone(),
+
         sandbox_type: SandboxType::TryMapping(MappingType::PreserveAsUser),
         username: whoami::username(),
         groupname: whoami::username(), // *shrug*
@@ -628,7 +631,7 @@ pub(crate) fn run_sandboxed(
         env: HashMap::new(),
     };
 
-    match sandbox.run(repo, r#ref, command, args) {
+    match sandbox.run(repo, command, args) {
         Err(err) => panic!("Failed to execute app in sandbox: {err}"),
     }
 }
