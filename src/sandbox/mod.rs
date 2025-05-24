@@ -634,6 +634,6 @@ pub(crate) fn run_sandboxed(
     };
 
     match sandbox.run(repo, command, args) {
-        Err(err) => panic!("Failed to execute app in sandbox: {err}"),
+        Err(err) => panic!("Failed to execute app in sandbox: {err:?}"),
     }
 }
