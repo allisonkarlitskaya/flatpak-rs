@@ -1,5 +1,6 @@
 mod index;
 mod install;
+mod instance;
 mod manifest;
 mod r#ref;
 mod sandbox;

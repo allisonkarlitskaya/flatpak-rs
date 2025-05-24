@@ -25,7 +25,7 @@ use rustix::{
     thread::{UnshareFlags, set_thread_gid, set_thread_groups, set_thread_uid, unshare},
 };
 
-use crate::{manifest::Manifest, r#ref::Ref};
+use crate::{instance::Instance, manifest::Manifest, r#ref::Ref};
 
 use self::{
     dirbuilder::DirBuilder,
@@ -311,6 +311,7 @@ fn unshare_userns_simple(inside_uid: u32, inside_gid: u32) -> Result<()> {
 
 struct Sandbox {
     r#ref: Ref,
+    instance: Instance,
 
     sandbox_type: SandboxType,
     uid: Uid,
@@ -619,6 +620,7 @@ pub(crate) fn run_sandboxed(
 ) -> ! {
     let mut sandbox = Sandbox {
         r#ref: r#ref.clone(),
+        instance: Instance::new_pid(),
 
         sandbox_type: SandboxType::TryMapping(MappingType::PreserveAsUser),
         username: whoami::username(),
