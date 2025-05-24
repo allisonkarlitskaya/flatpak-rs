@@ -13,7 +13,6 @@ composefs-oci = "0.3.0"
 composefs-fuse = "0.3.0"
 config = { version = "0.15.11", features = ["ini"] }
 dirs = "6.0.0"
-fuser = "0.15.1"
 hex = "0.4.3"
 http-cache-reqwest = "0.15.1"
 log = "0.4.27"
