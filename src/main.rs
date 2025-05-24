@@ -1,7 +1,6 @@
 mod index;
 mod install;
 mod manifest;
-mod mount_setattr;
 mod r#ref;
 mod sandbox;
 

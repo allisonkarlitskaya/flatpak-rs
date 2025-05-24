@@ -1,10 +1,14 @@
+mod dirbuilder;
+mod mount_setattr;
+mod mounthandle;
+mod util;
+
 use core::ops::Range;
 use std::{
     collections::HashSet,
     ffi::OsStr,
-    fmt,
     fs::File,
-    io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write as IoWrite},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     path::Path,
     process::{Command, exit},
     sync::Arc,
@@ -12,24 +16,22 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::RegularFile};
+use composefs_fuse::{open_fuse, serve_tree_fuse};
 use rustix::{
-    fd::{AsFd, AsRawFd, OwnedFd},
-    fs::{CWD, Gid, Mode, OFlags, Uid, fchown, mkdirat, open, openat, symlinkat},
-    io::{Errno, write},
-    mount::{
-        FsMountFlags, FsOpenFlags, MountAttrFlags, MountPropagationFlags, MoveMountFlags,
-        OpenTreeFlags, UnmountFlags, fsconfig_create, fsconfig_set_fd, fsconfig_set_flag,
-        fsconfig_set_string, fsmount, fsopen, move_mount, open_tree, unmount,
-    },
-    path::Arg as PathArg,
-    process::{fchdir, getgid, getpid, getuid, pivot_root},
+    fs::{CWD, Gid, Uid, fchown},
+    io::Errno,
+    process::{getgid, getpid, getuid},
     termios::ttyname,
     thread::{UnshareFlags, set_thread_gid, set_thread_groups, set_thread_uid, unshare},
 };
 
-use composefs_fuse::{open_fuse, serve_tree_fuse};
+use crate::{manifest::Manifest, r#ref::Ref};
 
-use crate::{manifest::Manifest, mount_setattr::mount_setattr, r#ref::Ref};
+use self::{
+    dirbuilder::DirBuilder,
+    mounthandle::{FsHandle, MountHandle},
+    util::{filter_errno, open_dir, write_to},
+};
 
 // ! is still experimental, so let's use this instead.
 enum Never {}
@@ -66,133 +68,6 @@ enum ShareFlags {
     Wayland,
 }
 
-// TODO: upstream this back into composefs?
-#[derive(Debug)]
-pub struct FsHandle {
-    fsfd: OwnedFd,
-    name: &'static str, // for debug messages
-}
-
-#[allow(dead_code)]
-impl FsHandle {
-    pub fn open(name: &'static str) -> Result<FsHandle> {
-        let fsfd = fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)
-            .with_context(|| format!("Failed to fsopen new {name:?}"))?;
-
-        Ok(FsHandle { fsfd, name })
-    }
-
-    pub fn set_flag(&self, flag: &str) -> Result<&Self> {
-        fsconfig_set_flag(self.fsfd.as_fd(), flag)
-            .with_context(|| format!("Failed to set flag {flag:?} on {:?}", self.name))?;
-        Ok(self)
-    }
-    pub fn set_string(&self, key: &str, value: &str) -> Result<&Self> {
-        fsconfig_set_string(self.fsfd.as_fd(), key, value)
-            .with_context(|| format!("Failed to set {key}={value:?} on {:?}", self.name))?;
-        Ok(self)
-    }
-
-    pub fn set_fd(&self, key: &str, value: impl AsFd + fmt::Debug) -> Result<&Self> {
-        fsconfig_set_fd(self.fsfd.as_fd(), key, value.as_fd())
-            .with_context(|| format!("Failed to set {key}={value:?} on {:?}", self.name))?;
-        Ok(self)
-    }
-
-    pub fn set_int(&self, key: &str, value: u32) -> Result<&Self> {
-        self.set_string(key, &format!("{value}"))
-    }
-
-    pub fn set_mode(&self, key: &str, value: u16) -> Result<&Self> {
-        self.set_string(key, &format!("{value:0o}"))
-    }
-
-    pub fn set_fd_str(&self, key: &str, value: impl AsFd) -> Result<&Self> {
-        self.set_string(key, &format!("{}", value.as_fd().as_raw_fd()))
-    }
-
-    pub fn mount(&self) -> Result<MountHandle> {
-        fsconfig_create(self.fsfd.as_fd())?;
-
-        Ok(MountHandle::new(fsmount(
-            self.fsfd.as_fd(),
-            FsMountFlags::FSMOUNT_CLOEXEC,
-            MountAttrFlags::empty(),
-        )?))
-    }
-}
-
-impl Drop for FsHandle {
-    fn drop(&mut self) {
-        let mut buffer = [0u8; 1024];
-        loop {
-            match rustix::io::read(&self.fsfd, &mut buffer) {
-                Err(_) | Ok(0) => return, // ENODATA, among others?
-                Ok(size) => eprintln!(
-                    "{:?}: {}",
-                    self.name,
-                    String::from_utf8(buffer[0..size].to_vec()).unwrap()
-                ),
-            }
-        }
-    }
-}
-
-pub struct MountHandle {
-    mountfd: OwnedFd,
-}
-
-impl MountHandle {
-    pub fn new(mountfd: OwnedFd) -> Self {
-        Self { mountfd }
-    }
-
-    pub fn clone(dirfd: impl AsFd, path: impl PathArg) -> Result<Self> {
-        let flags = OpenTreeFlags::OPEN_TREE_CLONE
-            | OpenTreeFlags::OPEN_TREE_CLOEXEC
-            | OpenTreeFlags::AT_EMPTY_PATH;
-        Ok(Self::new(open_tree(dirfd.as_fd(), path, flags)?))
-    }
-
-    pub fn clone_recursive(dirfd: impl AsFd, path: impl PathArg) -> Result<Self> {
-        let flags = OpenTreeFlags::OPEN_TREE_CLONE
-            | OpenTreeFlags::OPEN_TREE_CLOEXEC
-            | OpenTreeFlags::AT_RECURSIVE
-            | OpenTreeFlags::AT_EMPTY_PATH;
-        Ok(Self::new(open_tree(dirfd.as_fd(), path, flags)?))
-    }
-
-    pub fn pivot_root(&self) -> Result<()> {
-        fchdir(&self.mountfd)?;
-        pivot_root(".", ".")?;
-        unmount("/", UnmountFlags::DETACH)?;
-
-        Ok(())
-    }
-
-    pub fn make_readonly(&self) -> Result<()> {
-        mount_setattr(
-            &self.mountfd,
-            MountAttrFlags::MOUNT_ATTR_RDONLY,
-            MountAttrFlags::empty(),
-            MountPropagationFlags::empty(),
-        )
-        .context("Unable to make mount readonly")
-    }
-
-    pub fn move_to(&self, dirfd: impl AsFd, name: impl PathArg) -> Result<()> {
-        move_mount(
-            self.mountfd.as_fd(),
-            "",
-            dirfd.as_fd(),
-            name,
-            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
-        )?;
-
-        Ok(())
-    }
-}
-
 fn mount_tmpfs(name: &str, mode: u16) -> Result<MountHandle> {
     FsHandle::open("tmpfs")?
         .set_string("source", name)?
@@ -206,24 +81,6 @@ fn mount_devpts() -> Result<MountHandle> {
         .set_mode("ptmxmode", 0o666)?
         .set_mode("mode", 0o620)?
         .mount()
-}
-
-fn write_to(filename: &str, content: &str) -> Result<()> {
-    let fd = open(filename, OFlags::WRONLY, Mode::empty())
-        .with_context(|| format!("Failed to open {filename} for writing"))?;
-
-    write(fd, content.as_bytes())
-        .with_context(|| format!("Failed to write {content:?} to {filename}"))?;
-    Ok(())
-}
-
-fn open_path(dirfd: impl AsFd, name: impl PathArg, flags: OFlags) -> rustix::io::Result<OwnedFd> {
-    let flags = flags | OFlags::PATH | OFlags::CLOEXEC;
-    openat(dirfd, name, flags, Mode::empty())
-}
-
-fn open_dir(dirfd: impl AsFd, name: impl PathArg) -> rustix::io::Result<OwnedFd> {
-    open_path(dirfd, name, OFlags::DIRECTORY)
 }
 
 fn mount_fuse_composefs(
@@ -310,106 +167,6 @@ fn bind_controlling_terminal() -> Result<Option<MountHandle>> {
                 .with_context(|| format!("Failed to reopen controlling terminal device {name:?}"))
         })
         .transpose()
-}
-
-struct DirBuilder<'a> {
-    dirfd: &'a OwnedFd,
-}
-
-fn filter_errno<T>(result: rustix::io::Result<T>, ignored: Errno) -> rustix::io::Result<Option<T>> {
-    match result {
-        Ok(result) => Ok(Some(result)),
-        Err(err) if err == ignored => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-impl<'a> DirBuilder<'a> {
-    // Note: in case we do a simple uid map, we end up running some prep commands (like ldconfig) as
-    // the target uid:gid.  We do this while still holding a full set of capabilities, but the kernel
-    // automatically drops capabilities on execve() for non-numerically-0 effective uid.  Create
-    // our various directories around the filesystem such that these spawned commands can write to
-    // them even without caps: we're going to remount 'ro' before starting the application anyway.
-    const DIR_PERMISSION: u32 = 0o755;
-
-    // We don't have the same concerns around files, but let's be consistent.
-    const FILE_PERMISSION: u32 = 0o644;
-
-    fn new(dirfd: &'a OwnedFd) -> Self {
-        Self { dirfd }
-    }
-
-    fn create_dir(&self, name: &str, mode: u32, exist_ok: bool) -> Result<OwnedFd> {
-        let (dirfd, name) = if let Some((parent, name)) = name.rsplit_once('/') {
-            (&self.create_dir(parent, mode, true)?, name)
-        } else {
-            (self.dirfd, name)
-        };
-
-        // If exist_ok then optimistically assume that the directory might already exist
-        if exist_ok {
-            if let Some(dir) = filter_errno(open_dir(dirfd, name), Errno::NOENT)? {
-                return Ok(dir);
-            }
-        }
-
-        // Create the directory
-        match mkdirat(dirfd, name, mode.into()) {
-            Err(Errno::EXIST) if exist_ok => Ok(()), // recheck this (for races)
-            other => other,
-        }?;
-
-        Ok(open_dir(dirfd, name)?)
-    }
-
-    fn create_file(&self, name: &str) -> Result<OwnedFd> {
-        let (dirfd, name) = if let Some((parent, name)) = name.rsplit_once('/') {
-            (&self.create_dir(parent, Self::DIR_PERMISSION, true)?, name)
-        } else {
-            (self.dirfd, name)
-        };
-
-        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
-        openat(dirfd, name, flags, Self::FILE_PERMISSION.into())
-            .with_context(|| format!("Failed to open {name:?} for writing"))
-    }
-
-    fn subdir(&self, name: &str, populate: impl Fn(DirBuilder) -> Result<()>) -> Result<()> {
-        populate(DirBuilder {
-            dirfd: &self.create_dir(name, Self::DIR_PERMISSION, false)?,
-        })
-        .with_context(|| format!("Failed to populate subdir {name}"))
-    }
-
-    fn write(&self, name: &str, content: &str) -> Result<()> {
-        Ok(File::from(self.create_file(name)?).write_all(content.as_bytes())?)
-    }
-
-    fn tee(&self, name: &str) -> Result<BufWriter<File>> {
-        Ok(BufWriter::new(File::from(self.create_file(name)?)))
-    }
-
-    fn tee2(&self, name: &str, populate: impl Fn(BufWriter<File>) -> Result<()>) -> Result<()> {
-        populate(BufWriter::new(File::from(self.create_file(name)?)))
-            .with_context(|| format!("Failed to write to file {}", name))
-    }
-
-    fn symlink(&self, name: &str, target: &str) -> Result<()> {
-        symlinkat(target, self.dirfd, name)
-            .with_context(|| format!("Failed to symlink {name:?} -> {target:?}"))
-    }
-
-    fn mount(&self, name: &str, mnt: MountHandle) -> Result<()> {
-        mnt.move_to(self.create_dir(name, Self::DIR_PERMISSION, false)?, "")
-    }
-
-    fn bind_dir(&self, name: &str, from_dirfd: impl AsFd, from_name: impl PathArg) -> Result<()> {
-        self.mount(name, MountHandle::clone_recursive(from_dirfd, from_name)?)
-    }
-
-    fn bind_file(&self, name: &str, from_dirfd: impl AsFd, from_name: impl PathArg) -> Result<()> {
-        MountHandle::clone(from_dirfd, from_name)?.move_to(self.create_file(name)?, "")
-    }
 }
 
 fn find_range(filename: &str, username: &str) -> Result<Option<Range<u32>>> {
