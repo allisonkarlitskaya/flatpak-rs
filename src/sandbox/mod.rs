@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::RegularFile};
 use composefs_fuse::{open_fuse, serve_tree_fuse};
 use rustix::{
+    fd::OwnedFd,
     fs::{CWD, Gid, Uid, fchown},
     io::Errno,
     process::{getgid, getpid, getuid},
@@ -425,40 +426,53 @@ impl Sandbox {
         Ok(())
     }
 
-    fn populate_xdg_runtime_dir(&self, xdg_runtime_dir: DirBuilder, hostdir: &Path) -> Result<()> {
-        let hostdir = open_dir(CWD, hostdir)?;
-
+    fn populate_runtime_dir(&self, runtime_dir: DirBuilder, hostdir: &OwnedFd) -> Result<()> {
         if self.share.contains(&ShareFlags::Wayland) {
-            xdg_runtime_dir.bind_file("wayland-0", &hostdir, "wayland-0")?;
+            runtime_dir.bind_file("wayland-0", hostdir, "wayland-0")?;
         }
 
         if self.share.contains(&ShareFlags::SessionBus) {
-            xdg_runtime_dir.bind_file("bus", &hostdir, "bus")?;
+            runtime_dir.bind_file("bus", hostdir, "bus")?;
         }
 
         Ok(())
     }
 
-    fn populate_run(&self, run: DirBuilder) -> Result<()> {
-        if let Some(xdg_runtime_dir) = dirs::runtime_dir() {
-            run.subdir("user", |user| {
-                let uid = self.uid.as_raw().to_string();
-                if self.share.contains(&ShareFlags::XdgRuntimeDir) {
-                    user.bind_dir(&uid, CWD, &xdg_runtime_dir)
-                } else {
-                    user.subdir(&uid, |dir| {
-                        self.populate_xdg_runtime_dir(dir, &xdg_runtime_dir)
-                    })
-                }
-            })?;
-        }
+    fn populate_run_user(&mut self, user: DirBuilder) -> Result<()> {
+        let uid = self.uid.as_raw().to_string();
+        let Some(xdg_runtime_dir) = dirs::runtime_dir() else {
+            bail!("We require XDG_RUNTIME_DIR set on the host");
+        };
 
+        let hostdir = open_dir(CWD, &xdg_runtime_dir)
+            .with_context(|| format!("Unable to open XDG_RUNTIME_DIR {xdg_runtime_dir:?}"))?;
+
+        self.setenv("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
+
+        if self.share.contains(&ShareFlags::XdgRuntimeDir) {
+            user.bind_dir(&uid, hostdir, "")
+        } else {
+            user.populate_mount(
+                &uid,
+                FsHandle::open("tmpfs")?
+                    .set_string("source", "xdg-runtime-dir")?
+                    .set_mode("mode", 0o700)?
+                    .set_int("uid", self.uid.as_raw())?
+                    .set_int("gid", self.gid.as_raw())?
+                    .mount()?,
+                |dir| self.populate_runtime_dir(dir, &hostdir),
+            )
+        }
+    }
+
+    fn populate_run(&mut self, run: DirBuilder) -> Result<()> {
+        run.subdir("user", |user| self.populate_run_user(user))?;
         //run.bind_dir("host", CWD, "/");
 
         Ok(())
     }
 
-    fn populate_root(&self, root: &DirBuilder) -> Result<()> {
+    fn populate_root(&mut self, root: &DirBuilder) -> Result<()> {
         root.symlink("bin", "usr/bin")?;
         root.symlink("lib", "usr/lib")?;
         root.symlink("lib64", "usr/lib64")?;
@@ -488,7 +502,7 @@ impl Sandbox {
     }
 
     fn create_rootfs(
-        &self,
+        &mut self,
         app_mount: Option<MountHandle>,
         usr_mount: MountHandle,
     ) -> Result<MountHandle> {

@@ -73,7 +73,7 @@ impl<'a> DirBuilder<'a> {
     pub(super) fn subdir(
         &self,
         name: &str,
-        populate: impl Fn(DirBuilder) -> Result<()>,
+        mut populate: impl FnMut(DirBuilder) -> Result<()>,
     ) -> Result<()> {
         populate(DirBuilder {
             dirfd: &self.create_dir(name, Self::DIR_PERMISSION, false)?,
@@ -105,6 +105,19 @@ impl<'a> DirBuilder<'a> {
 
     pub(super) fn mount(&self, name: &str, mnt: MountHandle) -> Result<()> {
         mnt.move_to(self.create_dir(name, Self::DIR_PERMISSION, false)?, "")
+    }
+
+    pub(super) fn populate_mount(
+        &self,
+        name: &str,
+        mnt: MountHandle,
+        mut populate: impl FnMut(DirBuilder) -> Result<()>,
+    ) -> Result<()> {
+        mnt.move_to(self.create_dir(name, Self::DIR_PERMISSION, false)?, "")?;
+        populate(DirBuilder {
+            dirfd: &mnt.mountfd,
+        })
+        .with_context(|| format!("Failed to populate mount {name}"))
     }
 
     pub(super) fn bind_dir(
