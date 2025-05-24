@@ -32,10 +32,10 @@ pub(crate) fn mount_setattr(
         libc::syscall(
             libc::SYS_mount_setattr,
             dirfd.as_fd().as_raw_fd() as c_int,
-            b"\0".as_ptr() as *const c_char,
+            c"".as_ptr() as *const c_char,
             AtFlags::EMPTY_PATH.bits() as c_uint,
             &attr as *const MountAttr,
-            std::mem::size_of_val(&attr) as usize,
+            std::mem::size_of_val(&attr),
         )
     } {
         0 => Ok(()),
