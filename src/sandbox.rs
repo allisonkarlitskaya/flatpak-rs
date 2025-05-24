@@ -37,19 +37,25 @@ enum Never {}
 #[derive(Debug)]
 enum MappingType {
     #[allow(dead_code)]
-    NoPreserve,     // flat map of the subrange
+    /// flat map of the subrange
+    NoPreserve,
     #[allow(dead_code)]
-    PreserveAsRoot, // preserve the "outside" uid/gid as 0:0
-    PreserveAsUser, // preserve the "outside" uid/gid as the target user
+    /// preserve the "outside" uid/gid as 0:0
+    PreserveAsRoot,
+    /// preserve the "outside" uid/gid as the target user
+    PreserveAsUser,
 }
 
 #[derive(Debug)]
 enum SandboxType {
     #[allow(dead_code)]
-    Simple,                      // single uid/gid mapping
+    /// single uid/gid mapping
+    Simple,
     #[allow(dead_code)]
-    RequireMapping(MappingType), // require newuidmap/newgidmap
-    TryMapping(MappingType),     // use newuidmap/newgidmap if available
+    /// require newuidmap/newgidmap
+    RequireMapping(MappingType),
+    /// use newuidmap/newgidmap if available
+    TryMapping(MappingType),
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
