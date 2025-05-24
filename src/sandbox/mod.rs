@@ -2,6 +2,7 @@ mod dirbuilder;
 mod mount_setattr;
 mod mounthandle;
 mod util;
+mod wayland;
 
 use core::ops::Range;
 use std::{
@@ -31,6 +32,7 @@ use self::{
     dirbuilder::DirBuilder,
     mounthandle::{FsHandle, MountHandle},
     util::{filter_errno, open_dir, write_to},
+    wayland::bind_wayland_socket,
 };
 
 // ! is still experimental, so let's use this instead.
@@ -325,6 +327,7 @@ struct Sandbox {
     share: HashSet<ShareFlags>,
 
     env: HashMap<&'static str, Option<String>>,
+    fds: Vec<OwnedFd>,
 }
 
 impl Sandbox {
@@ -429,9 +432,19 @@ impl Sandbox {
         Ok(())
     }
 
-    fn populate_runtime_dir(&self, runtime_dir: DirBuilder, hostdir: &OwnedFd) -> Result<()> {
+    fn populate_runtime_dir(&mut self, runtime_dir: DirBuilder, hostdir: &OwnedFd) -> Result<()> {
         if self.share.contains(&ShareFlags::Wayland) {
-            runtime_dir.bind_file("wayland-0", hostdir, "wayland-0")?;
+            if let Some((name, close_fd)) = bind_wayland_socket(
+                &runtime_dir,
+                hostdir,
+                self.r#ref.get_id(),
+                self.instance.get_id(),
+            )? {
+                self.setenv("WAYLAND_DISPLAY", name);
+                self.fds.extend(close_fd);
+            }
+        } else {
+            self.unsetenv("WAYLAND_DISPLAY");
         }
 
         if self.share.contains(&ShareFlags::SessionBus) {
@@ -629,8 +642,10 @@ pub(crate) fn run_sandboxed(
         uid: getuid(),
         gid: getgid(),
         home: dirs::home_dir().unwrap().to_str().unwrap().to_string(),
-        share: HashSet::from([ShareFlags::Home, ShareFlags::XdgRuntimeDir]),
+        share: HashSet::from([ShareFlags::Home, ShareFlags::Wayland]),
+
         env: HashMap::new(),
+        fds: Vec::new(),
     };
 
     match sandbox.run(repo, command, args) {

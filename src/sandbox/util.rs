@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rustix::{
-    fd::{AsFd, OwnedFd},
-    fs::{Mode, OFlags, open, openat},
+    fd::{AsFd, AsRawFd, OwnedFd},
+    fs::{CWD, Mode, OFlags, open, openat},
     io::{Errno, write},
     path::Arg as PathArg,
 };
@@ -40,5 +40,19 @@ pub(super) fn filter_errno<T>(
         Ok(result) => Ok(Some(result)),
         Err(err) if err == ignored => Ok(None),
         Err(err) => Err(err),
+    }
+}
+
+/// Turns a (dirfd, name) pair into a filename for use with syscalls that don't have an _at()
+/// variant, such as the socket API.  Works like AT_EMPTY_PATH: name == "" uses the fd itself.
+pub(super) fn nameat(dirfd: impl AsFd, name: &str) -> String {
+    let fd = dirfd.as_fd().as_raw_fd();
+
+    if fd == CWD.as_raw_fd() || name.starts_with('/') {
+        name.to_string()
+    } else if name.is_empty() {
+        format!("/proc/self/fd/{fd}")
+    } else {
+        format!("/proc/self/fd/{fd}/{name}")
     }
 }
