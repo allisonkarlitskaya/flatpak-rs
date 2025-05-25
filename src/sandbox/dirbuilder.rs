@@ -75,10 +75,11 @@ impl<'a> DirBuilder<'a> {
         name: &str,
         mut populate: impl FnMut(DirBuilder) -> Result<()>,
     ) -> Result<()> {
-        populate(DirBuilder {
-            dirfd: &self.create_dir(name, Self::DIR_PERMISSION, false)?,
-        })
-        .with_context(|| format!("Failed to populate subdir {name}"))
+        let dirfd = &self
+            .create_dir(name, Self::DIR_PERMISSION, false)
+            .with_context(|| format!("Failed to create subdirectory {name}"))?;
+
+        populate(DirBuilder { dirfd }).with_context(|| format!("Failed to populate subdir {name}"))
     }
 
     pub(super) fn write(&self, name: &str, content: &str) -> Result<()> {
