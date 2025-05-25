@@ -10,16 +10,17 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader, ErrorKind, Read, Write},
+    os::unix::ffi::OsStringExt,
     process::{Command, exit},
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::RegularFile};
 use composefs_fuse::{open_fuse, serve_tree_fuse};
 use rustix::{
     fd::OwnedFd,
-    fs::{CWD, Gid, Uid, fchown},
+    fs::{CWD, Gid, Uid},
     io::Errno,
     process::{getgid, getpid, getuid},
     termios::ttyname,
@@ -322,7 +323,6 @@ struct Sandbox {
     username: String,
     groupname: String,
     gecos: String,
-    home: String,
 
     share: HashSet<ShareFlags>,
 
@@ -398,7 +398,7 @@ impl Sandbox {
         let uid = self.uid.as_raw();
         let gid = self.gid.as_raw();
         let gecos = &self.gecos;
-        let home = &self.home;
+        let home = self.home();
 
         // tee2() has better error reporting and manages the fp itself
         etc.tee2("passwd", |mut fp| {
@@ -488,7 +488,64 @@ impl Sandbox {
         Ok(())
     }
 
+    // The home directory is awkward.  We want to mount it at the end of the setup process, but we
+    // need to choose its location at the start.  Also: the location depends on the sandbox
+    // configuration itself (both the sharing settings and the username).  We could do this as
+    // initialize-on-first user but it would require repeated work, mutability, or interior
+    // mutability (OnceCell) and would require each user to handle errors.  This is not beautiful,
+    // but it works.
+    fn choose_home(&mut self) -> Result<()> {
+        self.setenv(
+            "HOME",
+            if self.share.contains(&ShareFlags::Home) {
+                let Some(home) = dirs::home_dir() else {
+                    bail!("Unable to determine home directory on host");
+                };
+
+                ensure!(
+                    home.is_absolute() && home.parent().is_some(),
+                    "Invalid home directory: {home:?}"
+                );
+
+                String::from_utf8(home.into_os_string().into_vec())
+                    .context("Home directory is not valid UTF-8")?
+            } else {
+                format!("/home/{}", self.username)
+            },
+        );
+        Ok(())
+    }
+
+    fn home(&self) -> &str {
+        // SAFETY: This is a programmer error.  We want it to panic.  See above.
+        self.env
+            .get("HOME")
+            .expect("You need to call .choose_home() first")
+            .as_ref()
+            .unwrap()
+    }
+
+    fn setup_home(&mut self, root: &DirBuilder) -> Result<()> {
+        let home_rel = &self.home()[1..];
+
+        if self.share.contains(&ShareFlags::Home) {
+            root.bind_dir(home_rel, CWD, dirs::home_dir().unwrap())
+        } else {
+            root.mount(
+                home_rel,
+                FsHandle::open("tmpfs")?
+                    .set_string("source", "home")?
+                    .set_mode("mode", 0o700)?
+                    .set_int("uid", self.uid.as_raw())?
+                    .set_int("gid", self.gid.as_raw())?
+                    .mount()?,
+            )
+        }
+    }
+
     fn populate_root(&mut self, root: &DirBuilder) -> Result<()> {
+        self.choose_home()?;
+
         root.symlink("bin", "usr/bin")?;
         root.symlink("lib", "usr/lib")?;
         root.symlink("lib64", "usr/lib64")?;
@@ -502,17 +559,8 @@ impl Sandbox {
         root.bind_dir("sys", CWD, "/sys")?;
         root.mount("tmp", mount_tmpfs("tmp", 0o1777)?)?;
 
-        if let Some(rel) = self.home.strip_prefix("/") {
-            if self.share.contains(&ShareFlags::Home) {
-                root.bind_dir(rel, CWD, &self.home)?;
-            } else {
-                fchown(
-                    root.create_dir(rel, 0o755, false)?,
-                    Some(self.uid),
-                    Some(self.gid),
-                )?;
-            }
-        }
+        self.setup_home(root)
+            .context("Failed to setup home directory")?;
 
         Ok(())
     }
@@ -598,7 +646,7 @@ impl Sandbox {
         // Run our command
         let mut command = Command::new(command);
         command.args(args);
-        command.current_dir(&self.home);
+        command.current_dir(self.home());
         command.envs(runtime_manifest.get_environment()?);
 
         for (key, value) in &self.env {
@@ -641,8 +689,8 @@ pub(crate) fn run_sandboxed(
         gecos: whoami::realname(),
         uid: getuid(),
         gid: getgid(),
-        home: dirs::home_dir().unwrap().to_str().unwrap().to_string(),
-        share: HashSet::from([ShareFlags::Home, ShareFlags::Wayland]),
+
+        share: HashSet::from([ShareFlags::Wayland]),
 
         env: HashMap::new(),
         fds: Vec::new(),
