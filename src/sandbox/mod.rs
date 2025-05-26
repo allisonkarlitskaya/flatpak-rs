@@ -1,8 +1,11 @@
+mod argsfd;
+mod dbus;
 mod dirbuilder;
 mod mount_setattr;
 mod mounthandle;
 mod util;
 mod wayland;
+mod withfds;
 
 use core::ops::Range;
 use std::{
@@ -30,10 +33,12 @@ use rustix::{
 use crate::{instance::Instance, manifest::Manifest, r#ref::Ref};
 
 use self::{
+    dbus::dbus_proxy,
     dirbuilder::DirBuilder,
     mounthandle::{FsHandle, MountHandle},
     util::{filter_errno, open_dir, write_to},
     wayland::bind_wayland_socket,
+    withfds::WithFds,
 };
 
 // ! is still experimental, so let's use this instead.
@@ -389,8 +394,13 @@ impl Sandbox {
 
     fn populate_etc(&self, etc: DirBuilder) -> Result<()> {
         let host_etc = open_dir(CWD, "/etc")?;
+
         for name in ["resolv.conf", "localtime"] {
             etc.bind_file(name, &host_etc, name)?;
+        }
+
+        for name in ["ssl", "pki", "crypto-policies"] {
+            etc.bind_dir(name, &host_etc, name)?;
         }
 
         let username = &self.username;
@@ -448,7 +458,17 @@ impl Sandbox {
         }
 
         if self.share.contains(&ShareFlags::SessionBus) {
+            runtime_dir.bind_file("at-spi/bus", hostdir, "at-spi/bus")?;
             runtime_dir.bind_file("bus", hostdir, "bus")?;
+        } else {
+            dbus_proxy(
+                runtime_dir.create_dir("at-spi", 0o755, false)?,
+                "bus",
+                hostdir,
+                "at-spi/bus",
+                &[],
+            )?;
+            dbus_proxy(&runtime_dir, "bus", hostdir, "bus", &[])?;
         }
 
         Ok(())
@@ -481,8 +501,19 @@ impl Sandbox {
         }
     }
 
+    fn populate_run_dbus(&self, dbus: DirBuilder) -> Result<()> {
+        dbus_proxy(
+            dbus,
+            "system_bus_socket",
+            open_dir(CWD, "/run/dbus")?,
+            "system_bus_socket",
+            &[],
+        )
+    }
+
     fn populate_run(&mut self, run: DirBuilder) -> Result<()> {
         run.subdir("user", |user| self.populate_run_user(user))?;
+        run.subdir("dbus", |dbus| self.populate_run_dbus(dbus))?;
         //run.bind_dir("host", CWD, "/");
 
         Ok(())
@@ -662,6 +693,7 @@ impl Sandbox {
         command.env("PS1", "[📦 $FLATPAK_ID \\W]\\$ ");
 
         let status = command
+            .with_fds([])
             .status()
             .with_context(|| format!("Unable to spawn {command:?}"))?;
 

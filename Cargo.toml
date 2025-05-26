@@ -35,6 +35,6 @@ opt-level = 3
 
 
 [patch.crates-io]
-composefs = { git = "https://github.com/allisonkarlitskaya/composefs-rs", branch = "fuse" }
-composefs-oci = { git = "https://github.com/allisonkarlitskaya/composefs-rs", branch = "fuse" }
-composefs-fuse = { git = "https://github.com/allisonkarlitskaya/composefs-rs", branch = "fuse" }
+composefs = { git = "https://github.com/allisonkarlitskaya/composefs-rs", rev = "2e7a64ff4f3c8e775f492f7e92e8672921645e46" }
+composefs-oci = { git = "https://github.com/allisonkarlitskaya/composefs-rs", rev = "2e7a64ff4f3c8e775f492f7e92e8672921645e46" }
+composefs-fuse = { git = "https://github.com/allisonkarlitskaya/composefs-rs", rev = "2e7a64ff4f3c8e775f492f7e92e8672921645e46" }
